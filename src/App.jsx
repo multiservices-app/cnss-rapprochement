@@ -7,6 +7,13 @@ import * as XLSX from "xlsx-js-style";
 const MONDAY_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjI0NzU0NjgyNSwiYWFpIjoxMSwidWlkIjo0MDI1Nzg1MiwiaWFkIjoiMjAyMy0wMy0yOFQxNzo0MTozMC4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6MTU1OTc4MTUsInJnbiI6ImV1YzEifQ.E20krB-L2O750U1V1vmj5HqW2AsZKz40DXU16OHopGU";
 const BOARD_ID = "5096517828"; // CONTRAT_GLOBAL
 
+// ══════════════════════════════════════════════════════════════
+//  CONFIG GITHUB
+// ══════════════════════════════════════════════════════════════
+const GITHUB_OWNER  = "multiservices-app";
+const GITHUB_REPO   = "cnss-rapprochement";
+const GITHUB_BRANCH = "main";
+
 // Colonnes Monday (IDs fixes standardisés)
 const COL = {
   cnss:    "ncnss",
@@ -283,6 +290,90 @@ function exportProjectExcel(projet, societe, periode, found, notFound, bdsHeader
 }
 
 // ══════════════════════════════════════════════════════════════
+//  GITHUB SAVE FUNCTION
+// ══════════════════════════════════════════════════════════════
+async function saveToGitHub(projet, periode, found, notFound, bdsHeaders, githubToken) {
+  if (!githubToken) throw new Error("Token GitHub requis");
+
+  // Générer le contenu Excel en base64
+  const wb = XLSX.utils.book_new();
+  const headers1 = bdsHeaders.length > 0
+    ? [...bdsHeaders, "Statut"]
+    : ["N° CNSS","Nom et Prénom","Nb Jours","Salaire Brut","Statut"];
+  const ws1 = XLSX.utils.aoa_to_sheet([
+    headers1,
+    ...found.map(a => [...(a.row || [a.cnss, a.nom, a.jours||"", a.salaire||""]), "DÉCLARÉ ✓"])
+  ]);
+  XLSX.utils.book_append_sheet(wb, ws1, "Agents Trouvés");
+
+  const ws2 = XLSX.utils.aoa_to_sheet([
+    ["N° CNSS","Nom / Prénom","Projet","Société","Statut"],
+    ...notFound.map(a => [a.cnss, a.nom, a.projet, a.societe, "INTROUVABLE ✗"])
+  ]);
+  XLSX.utils.book_append_sheet(wb, ws2, "Agents Introuvables");
+
+  const taux = found.length + notFound.length > 0
+    ? Math.round(found.length / (found.length + notFound.length) * 100) : 0;
+  const ws3 = XLSX.utils.aoa_to_sheet([
+    ["RÉCAPITULATIF"], ["Projet",projet], ["Période",periode],
+    ["Trouvés",found.length], ["Introuvables",notFound.length], ["Taux",`${taux}%`]
+  ]);
+  XLSX.utils.book_append_sheet(wb, ws3, "Récapitulatif");
+
+  // Convertir en base64
+  const wbArray = XLSX.write(wb, { bookType: "xlsx", type: "base64" });
+  const dateStr  = new Date().toISOString().slice(0,10);
+  const safeName = projet.replace(/[^a-zA-Z0-9_\-]/g,"_");
+  const safePer  = periode.replace("/","-");
+  const fileName = `resultats/${dateStr}_${safeName}_${safePer}.xlsx`;
+
+  const apiBase = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
+  const headers = {
+    Authorization: `token ${githubToken}`,
+    Accept: "application/vnd.github.v3+json",
+    "Content-Type": "application/json",
+  };
+
+  // ── Vérifier accès au repo ─────────────────────────────────
+  const repoCheck = await fetch(`${apiBase}`, { headers });
+  if (!repoCheck.ok) {
+    const e = await repoCheck.json();
+    throw new Error(`Repo inaccessible : ${e.message}. Vérifiez le token et le repo.`);
+  }
+
+  // ── Vérifier si le fichier existe déjà (pour son SHA) ─────
+  let sha = undefined;
+  try {
+    const checkRes = await fetch(`${apiBase}/contents/${fileName}`, { headers });
+    if (checkRes.ok) {
+      const existing = await checkRes.json();
+      sha = existing.sha;
+    }
+  } catch {}
+
+  // ── Uploader le fichier Excel ──────────────────────────────
+  const body = {
+    message: `Résultat CNSS — ${projet} — ${periode} — ${dateStr}`,
+    content: wbArray,
+    branch:  GITHUB_BRANCH,
+    ...(sha ? { sha } : {})
+  };
+
+  const res = await fetch(`${apiBase}/contents/${fileName}`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(`GitHub API : ${err.message}`);
+  }
+
+  return `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/blob/${GITHUB_BRANCH}/${fileName}`;
+}
+
+// ══════════════════════════════════════════════════════════════
 //  MAIN APP COMPONENT
 // ══════════════════════════════════════════════════════════════
 export default function CNSSRapprochement() {
@@ -294,7 +385,9 @@ export default function CNSSRapprochement() {
   const [error, setError] = useState("");
   const [activeTab, setActiveTab] = useState("bds");
   const [manualAgents, setManualAgents] = useState("");
-  const [personnelSource, setPersonnelSource] = useState("monday"); // "monday" | "excel" | "manual"
+  const [personnelSource, setPersonnelSource] = useState("monday");
+  const [githubToken, setGithubToken] = useState("");
+  const [githubStatus, setGithubStatus] = useState({}); // { [resultId]: "saving"|"saved"|"error" }
   const bdsInputRef = useRef();
   const personnelInputRef = useRef();
 
@@ -477,6 +570,17 @@ export default function CNSSRapprochement() {
           </div>
         </div>
         {loadingMsg && <div style={{ background: "#1e3a5f", border: "1px solid #3b82f6", borderRadius: 8, padding: "8px 16px", fontSize: 13, color: "#93c5fd" }}>{loadingMsg}</div>}
+        {/* GitHub Token (optionnel) */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 16 }}>🐙</span>
+          <input
+            value={githubToken}
+            onChange={e => setGithubToken(e.target.value)}
+            placeholder="Token GitHub (optionnel)"
+            type="password"
+            style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 8, padding: "6px 12px", color: "#e2e8f0", fontSize: 12, width: 200 }}
+          />
+        </div>
       </div>
 
       {/* TABS */}
@@ -744,6 +848,40 @@ export default function CNSSRapprochement() {
                         style={{ background: "linear-gradient(135deg, #059669, #047857)", border: "none", borderRadius: 10, padding: "10px 18px", color: "white", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
                       >
                         ⬇️ Télécharger BDS filtré
+                      </button>
+                      {/* Bouton GitHub optionnel */}
+                      <button
+                        title={githubToken ? "Sauvegarder sur GitHub" : "Entrez un token GitHub dans l'en-tête pour activer"}
+                        disabled={!githubToken || githubStatus[r.id] === "saving"}
+                        onClick={async () => {
+                          setGithubStatus(prev => ({ ...prev, [r.id]: "saving" }));
+                          try {
+                            const url = await saveToGitHub(r.projet, r.periode, r.found, r.notFound, r.bdsHeaders, githubToken);
+                            setGithubStatus(prev => ({ ...prev, [r.id]: "saved" }));
+                            setTimeout(() => setGithubStatus(prev => ({ ...prev, [r.id]: null })), 4000);
+                          } catch (e) {
+                            setGithubStatus(prev => ({ ...prev, [r.id]: "error" }));
+                            setError("GitHub : " + e.message);
+                            setTimeout(() => setGithubStatus(prev => ({ ...prev, [r.id]: null })), 4000);
+                          }
+                        }}
+                        style={{
+                          background: githubStatus[r.id] === "saved"  ? "linear-gradient(135deg,#6d28d9,#4c1d95)"
+                                    : githubStatus[r.id] === "error"   ? "linear-gradient(135deg,#dc2626,#991b1b)"
+                                    : githubStatus[r.id] === "saving"  ? "#334155"
+                                    : "linear-gradient(135deg,#1f2937,#111827)",
+                          border: "1px solid #475569", borderRadius: 10, padding: "10px 18px",
+                          color: !githubToken ? "#475569" : "white",
+                          fontSize: 13, fontWeight: 600,
+                          cursor: !githubToken || githubStatus[r.id] === "saving" ? "not-allowed" : "pointer",
+                          opacity: !githubToken ? 0.5 : 1,
+                          transition: "all 0.3s",
+                        }}
+                      >
+                        {githubStatus[r.id] === "saving" ? "⏳ Envoi..." :
+                         githubStatus[r.id] === "saved"  ? "✅ Sauvegardé !" :
+                         githubStatus[r.id] === "error"  ? "❌ Erreur" :
+                         "🐙 Sauvegarder GitHub"}
                       </button>
                     </div>
                   </div>
